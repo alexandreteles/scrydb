@@ -973,20 +973,20 @@ class Index:
         rerank_depth: int = 200,
         candidate_ids: "list[str] | None" = None,
     ):
-        stored, float_vector = self._query_material(query_text, query_id)
-        base_ranked = self._vec_search("documents", precision, stored, float_vector, limit, candidate_ids)
-
-        if not rerank:
-            return base_ranked
         if rerank == precision:
             raise ValueError(
                 f"mode='semantic' is already {precision!r}-ranked; rerank={rerank!r} would "
                 "be a no-op. Use a different precision, e.g. rerank='float' for Binary >> "
                 "Float/Cosine."
             )
-        return self._rerank_vec(
-            base_ranked, rerank, limit=limit, rerank_depth=rerank_depth, stored=stored, float_vector=float_vector
+        first_stage_limit = rerank_depth if rerank else limit
+        stored, float_vector = self._query_material(query_text, query_id)
+        base_ranked = self._vec_search(
+            "documents", precision, stored, float_vector, first_stage_limit, candidate_ids
         )
+        if not rerank:
+            return base_ranked
+        return self._rerank_vec(base_ranked, rerank, limit=limit, stored=stored, float_vector=float_vector)
 
     @staticmethod
     def _normalize_rerank(rerank: "bool | str | None") -> "str | None":
@@ -1007,7 +1007,6 @@ class Index:
         base_ranked,
         rerank_with: str,
         limit: int,
-        rerank_depth: "int | None" = None,
         stored: "dict | None" = None,
         float_vector: "np.ndarray | None" = None,
         query_text: "str | None" = None,
@@ -1016,13 +1015,12 @@ class Index:
         """Second-stage rerank of an ordered (doc_id, extra) list — the
         shared machinery behind BM25 >> Binary, BM25 >> Int8, BM25 >>
         Float/Cosine, and e.g. Binary >> Float/Cosine. *rerank_with*
-        selects the vec0 precision used. *base_ranked* is truncated to
-        *rerank_depth* candidates before reranking, if given."""
+        selects the vec0 precision used. The caller supplies the first-stage
+        candidate pool and *limit* caps the final ranking."""
         if not base_ranked:
             return []
-        shortlist = base_ranked[:rerank_depth] if rerank_depth is not None else base_ranked
-        base_extra = dict(shortlist)
-        candidate_ids = [doc_id for doc_id, _ in shortlist]
+        base_extra = dict(base_ranked)
+        candidate_ids = [doc_id for doc_id, _ in base_ranked]
 
         if stored is None:
             stored, float_vector = self._query_material(query_text, query_id)
