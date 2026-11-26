@@ -1045,7 +1045,9 @@ class Index:
                 score += 1.0 / (rrf_k + semantic_ranks[doc_id])
             scores[doc_id] = score
 
-        ranked_ids = sorted(scores, key=lambda d: scores[d], reverse=True)
+        # The input is a set union. Break equal scores by external document
+        # ID so that tied hits at the output cutoff are reproducible.
+        ranked_ids = sorted(scores, key=lambda doc_id: (-scores[doc_id], doc_id))
         return [
             (
                 doc_id,
