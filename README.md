@@ -188,6 +188,11 @@ Notes:
 - **Plain Python access**: `docker run --rm -it -v "$PWD/data":/data --entrypoint python3 scrydb`
   drops into an interpreter with `scrydb` importable.
 
+For embedded inputs, the CLI stores binary and float vectors by default.
+Pass `--no-store-full` to `index` or `auto` to omit the float copy for
+documents and stored queries. Add `--store-int8` to keep an int8 copy as
+well. A float rerank requires stored float document vectors.
+
 ## How extension discovery works at runtime
 
 `Index.open()`/`Index()` default to `vec_ext_path="auto"`, which loads
