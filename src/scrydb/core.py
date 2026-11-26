@@ -833,9 +833,11 @@ class Index:
         ids = self._resolve_query_ids(queries)
         run = Run()
         desc = f"batch_search(mode={mode!r}, rerank={rerank_with!r})"
-        for query_id in tqdm(ids, desc=desc, unit="queries"):
-            query_payload = self.queries.get(query_id) or {}
-            query_text = query_payload.get("text")
+        required = (precision_n,) if mode in ("semantic", "hybrid") else ()
+        if required and rerank_with and rerank_with != precision_n:
+            required += (rerank_with,)
+        inputs = self._batch_query_inputs(ids, required)
+        for query_id, query_text, query_material in tqdm(inputs, total=len(ids), desc=desc, unit="queries"):
 
             if mode == "lexical":
                 if query_text is None:
@@ -850,6 +852,7 @@ class Index:
                 ranked = self._semantic_rank(
                     query_text=query_text,
                     query_id=query_id,
+                    material=query_material,
                     limit=top_k,
                     precision=precision_n,
                     rerank=rerank_with,
@@ -864,6 +867,7 @@ class Index:
                 semantic = self._semantic_rank(
                     query_text=query_text,
                     query_id=query_id,
+                    material=query_material,
                     limit=candidate_limit,
                     precision=precision_n,
                     rerank=rerank_with,
@@ -972,8 +976,12 @@ class Index:
         rerank: "str | None" = None,
         rerank_depth: int = 200,
         candidate_ids: "list[str] | None" = None,
+        material=None,
     ):
-        stored, float_vector = self._query_material(query_text, query_id)
+        if material is None:
+            required = (precision, rerank) if rerank and rerank != precision else (precision,)
+            material = self._query_materials([(query_id, query_text)], required)[0]
+        stored, float_vector = material
         base_ranked = self._vec_search("documents", precision, stored, float_vector, limit, candidate_ids)
 
         if not rerank:
@@ -1025,7 +1033,7 @@ class Index:
         candidate_ids = [doc_id for doc_id, _ in shortlist]
 
         if stored is None:
-            stored, float_vector = self._query_material(query_text, query_id)
+            stored, float_vector = self._query_materials([(query_id, query_text)], (rerank_with,))[0]
 
         reranked = self._vec_search("documents", rerank_with, stored, float_vector, limit, candidate_ids)
         return [(doc_id, {**base_extra.get(doc_id, {}), **extra}) for doc_id, extra in reranked]
@@ -1071,39 +1079,47 @@ class Index:
 
     # -- sqlite-vec search internals ----------------------------------------
 
-    def _query_material(self, query_text: "str | None", query_id: "str | None"):
-        """Return ``(stored, float_vector)`` for a query: *stored* is
-        ``{"binary"|"int8"|"float": blob-or-None}`` of whatever precomputed
-        embeddings are stored for *query_id* (via :meth:`index_queries`),
-        and *float_vector* is a raw float32 ``np.ndarray`` — the stored
-        full-precision embedding if present, else *query_text* encoded
-        with the attached model, else ``None``.
+    def _query_materials(self, queries, precisions):
+        """Resolve a bounded group of queries, batching only the missing model inputs."""
+        materials = []
+        missing = []
+        for query_id, query_text in queries:
+            stored = {}
+            if query_id is not None:
+                for precision in precisions:
+                    blob = self._stored_embedding_blob("queries", precision, query_id)
+                    if blob is not None:
+                        stored[precision] = blob
+            vector = None
+            if any(precision not in stored for precision in precisions):
+                # A stored float vector can supply any requested representation.
+                blob = stored.get("float")
+                if blob is None and query_id is not None and "float" not in precisions:
+                    blob = self._stored_embedding_blob("queries", "float", query_id)
+                if blob is not None:
+                    vector = np.frombuffer(blob, dtype=np.float32)
+                elif query_text is None:
+                    raise ValueError(f"Query {query_id!r} has no compatible embedding or text to encode")
+                elif self._model is None:
+                    raise RuntimeError("No compatible query embedding. Attach a model or index a query vector.")
+                else:
+                    missing.append((len(materials), query_text))
+            materials.append((stored, vector))
 
-        Storage is preferred over re-encoding so a query searched at
-        ``precision="binary"`` can use its exact indexed binary vector
-        without needing a float vector (or a model) at all."""
-        stored = {"binary": None, "int8": None, "float": None}
-        if query_id is not None:
-            for precision in stored:
-                stored[precision] = self._stored_embedding_blob("queries", precision, query_id)
+        if missing:
+            vectors = self._model.encode_queries([text for _, text in missing])
+            if len(vectors) != len(missing):
+                raise ValueError("Encoder returned a different number of vectors than input queries")
+            for (pos, _), vector in zip(missing, vectors):
+                materials[pos] = (materials[pos][0], np.asarray(vector, dtype=np.float32))
+        return materials
 
-        float_vector = None
-        if stored["float"] is not None:
-            float_vector = np.frombuffer(stored["float"], dtype=np.float32)
-        elif query_text is not None and self._model is not None:
-            float_vector = self._model.encode_queries([query_text])[0].astype(np.float32)
-
-        if float_vector is None and all(v is None for v in stored.values()):
-            if query_text is None:
-                raise ValueError(
-                    "No query embedding available: no stored embedding for this query id, "
-                    "and no query text to encode."
-                )
-            raise RuntimeError(
-                "Semantic/hybrid search requires a model — call index.add_model(...) first, "
-                "or index this query's embedding via index_queries()."
-            )
-        return stored, float_vector
+    def _batch_query_inputs(self, ids, precisions):
+        for offset in range(0, len(ids), 32):
+            batch = [(qid, (self.queries.get(qid) or {}).get("text")) for qid in ids[offset:offset + 32]]
+            materials = self._query_materials(batch, precisions) if precisions else [None] * len(batch)
+            for (qid, text), material in zip(batch, materials):
+                yield qid, text, material
 
     def _stored_embedding_blob(self, collection: str, precision: str, item_id: str) -> "bytes | None":
         table = f"vec_{collection}_{precision}"
