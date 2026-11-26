@@ -84,6 +84,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 text_field=args.text_field,
                 embedding_field=args.embedding_field,
                 store_int8_embeddings=args.store_int8,
+                store_full_embeddings=args.store_full,
             )
         if args.queries:
             print(f"scrydb: indexing queries from {args.queries} -> {args.db}", file=sys.stderr)
@@ -93,6 +94,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 text_field=args.text_field,
                 embedding_field=args.embedding_field,
                 store_int8_embeddings=args.store_int8,
+                store_full_embeddings=args.store_full,
             )
     return 0
 
@@ -150,6 +152,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
                 text_field=args.text_field,
                 embedding_field=args.embedding_field,
                 store_int8_embeddings=args.store_int8,
+                store_full_embeddings=args.store_full,
             )
         if queries:
             print(f"scrydb: indexing queries from {queries} -> {args.db}", file=sys.stderr)
@@ -159,6 +162,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
                 text_field=args.text_field,
                 embedding_field=args.embedding_field,
                 store_int8_embeddings=args.store_int8,
+                store_full_embeddings=args.store_full,
             )
 
         if args.query:
@@ -219,6 +223,12 @@ def _add_field_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--text-field", default=_env("SCRYDB_TEXT_FIELD", "text"), help="env: SCRYDB_TEXT_FIELD")
     parser.add_argument(
         "--embedding-field", default=_env("SCRYDB_EMBEDDING_FIELD", "emb"), help="env: SCRYDB_EMBEDDING_FIELD"
+    )
+    parser.add_argument(
+        "--store-full", action=argparse.BooleanOptionalAction,
+        default=_env("SCRYDB_STORE_FULL", "true").lower() not in ("0", "false", "no", "off"),
+        help="Store float vectors (default enabled). Use --no-store-full to omit them "
+             "(env: SCRYDB_STORE_FULL).",
     )
     parser.add_argument(
         "--store-int8", action="store_true", default=_env("SCRYDB_STORE_INT8", "") not in ("", "0", "false", "False"),
