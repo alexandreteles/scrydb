@@ -1061,13 +1061,20 @@ class Index:
         ]
 
     def _materialize(self, ranked, limit: int) -> list[SearchResult]:
-        results = []
-        for doc_id, extra in ranked[:limit]:
-            document = self.documents.get(doc_id)
-            if document is None:
-                continue
-            results.append(SearchResult(id=doc_id, document=document, **extra))
-        return results
+        hits = ranked[:limit]
+        ids = list(dict.fromkeys(doc_id for doc_id, _ in hits))
+        payloads = {}
+        # Older SQLite builds allow at most 999 bound variables in a statement.
+        for start in range(0, len(ids), 900):
+            group = ids[start:start + 900]
+            placeholders = ",".join("?" for _ in group)
+            payloads.update(self.conn.execute(
+                f"SELECT id, payload FROM documents WHERE id IN ({placeholders})", group
+            ))
+        return [
+            SearchResult(id=doc_id, document=json.loads(payloads[doc_id]), **extra)
+            for doc_id, extra in hits if doc_id in payloads
+        ]
 
     # -- sqlite-vec search internals ----------------------------------------
 
