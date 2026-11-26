@@ -587,7 +587,9 @@ class Index:
         that row. Binary-quantized embeddings are always stored whenever a
         vector is available; *store_full_embeddings*/*store_int8_embeddings*
         additionally store full-precision/int8-quantized copies (all
-        quantization happens inside SQLite via ``sqlite-vec``).
+        quantization happens inside SQLite via ``sqlite-vec``). An upsert
+        replaces the entire record. Old vector precisions omitted from the
+        replacement are removed. Each batch commits atomically.
         """
         self._index_rows(
             _rows_from(source),
@@ -654,63 +656,54 @@ class Index:
         if store_full_embeddings:
             precisions.append("float")
 
-        payload_batch: list = []
-        text_batch: list = []  # (id, text) for FTS (documents only)
-        emb_batch: list = []  # (id, float32 ndarray)
-        pending_encode: list = []  # (id, text) rows needing the attached model
-
-        desc = "Indexing queries" if is_query else "Indexing documents"
-        pbar = tqdm(desc=desc, unit="rows", unit_scale=True, total=limit)
+        # The last occurrence of an ID wins, including its text and embedding.
+        batch = {}
 
         def flush():
-            id_rowids = self._flush_payloads(table, payload_batch, None if is_query else text_batch)
-            self._flush_vec_embeddings(table, id_rowids, emb_batch, precisions)
-            payload_batch.clear()
-            text_batch.clear()
-            emb_batch.clear()
+            payloads, texts, embeddings, pending = [], [], [], []
+            for item_id, (payload, text, vector) in batch.items():
+                payloads.append((item_id, payload))
+                if not is_query:
+                    texts.append((item_id, text))
+                if vector is not None:
+                    embeddings.append((item_id, np.asarray(vector, dtype=np.float32)))
+                elif self._model is not None and text is not None:
+                    pending.append((item_id, text))
+            if pending:
+                self._encode_and_append(pending, embeddings, is_query)
+            with self.conn:
+                id_rowids = self._flush_payloads(table, payloads, texts)
+                self._flush_vec_embeddings(table, id_rowids, embeddings, precisions)
+            batch.clear()
 
-        n = 0
-        for row in rows:
-            if limit is not None and n >= limit:
-                break
-            if id_field not in row:
-                raise KeyError(f"Missing id field: {id_field!r}")
-
-            item_id = str(row[id_field])
-            payload = {k: v for k, v in row.items() if k != embedding_field}
-            payload_batch.append((item_id, json.dumps(payload, ensure_ascii=False)))
-
-            text = row.get(text_field)
-            if not is_query:
-                if text_field not in row:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        desc = "Indexing queries" if is_query else "Indexing documents"
+        with tqdm(desc=desc, unit="rows", unit_scale=True, total=limit) as pbar:
+            for n, row in enumerate(rows):
+                if limit is not None and n >= limit:
+                    break
+                if id_field not in row:
+                    raise KeyError(f"Missing id field: {id_field!r}")
+                if not is_query and text_field not in row:
                     raise KeyError(f"Missing text field: {text_field!r}")
-                text_batch.append((item_id, str(text)))
-
-            emb = row.get(embedding_field)
-            if emb is not None:
-                emb_batch.append((item_id, np.asarray(emb, dtype=np.float32)))
-            elif self._model is not None and text is not None:
-                pending_encode.append((item_id, str(text)))
-
-            n += 1
-            if len(payload_batch) >= batch_size:
-                if pending_encode:
-                    self._encode_and_append(pending_encode, emb_batch, is_query)
-                    pending_encode.clear()
+                item_id = str(row[id_field])
+                payload = {k: v for k, v in row.items() if k != embedding_field}
+                text = row.get(text_field)
+                text = str(text) if text is not None or not is_query else None
+                batch[item_id] = (json.dumps(payload, ensure_ascii=False), text, row.get(embedding_field))
+                if (n + 1) % batch_size == 0:
+                    flush()
+                pbar.update(1)
+            if batch:
                 flush()
-            pbar.update(1)
-
-        if pending_encode:
-            self._encode_and_append(pending_encode, emb_batch, is_query)
-        if payload_batch or emb_batch:
-            flush()
-        pbar.close()
 
     def _encode_and_append(self, pending, emb_batch, is_query) -> None:
-        ids = [item_id for item_id, _ in pending]
         texts = [text for _, text in pending]
         vectors = self._model.encode_queries(texts) if is_query else self._model.encode_documents(texts)
-        for item_id, vec in zip(ids, vectors):
+        if len(vectors) != len(pending):
+            raise ValueError("Encoder returned a different number of vectors than input texts")
+        for (item_id, _), vec in zip(pending, vectors):
             emb_batch.append((item_id, np.asarray(vec, dtype=np.float32)))
 
     # -- interactive search --------------------------------------------------
@@ -1230,7 +1223,6 @@ class Index:
             return
         coldef = _COLUMN_DEF[precision](dim)
         self.conn.execute(f"CREATE VIRTUAL TABLE {table} USING vec0({coldef})")
-        self.conn.commit()
 
     def _load_vec_extension(self, ext_path: str) -> None:
         if ext_path == "auto":
@@ -1271,18 +1263,17 @@ class Index:
         ``documents_fts`` (documents only)."""
         if not payload_batch:
             return {}
-        with self.conn:
-            self.conn.executemany(
-                f"INSERT INTO {table} (id, payload) VALUES (?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
-                payload_batch,
-            )
-            if text_batch:
-                # FTS5 has no INSERT OR REPLACE, so delete first.
-                ids = [row[0] for row in text_batch]
-                placeholders = ",".join("?" for _ in ids)
-                self.conn.execute(f"DELETE FROM documents_fts WHERE id IN ({placeholders})", ids)
-                self.conn.executemany("INSERT INTO documents_fts (id, text) VALUES (?, ?)", text_batch)
+        self.conn.executemany(
+            f"INSERT INTO {table} (id, payload) VALUES (?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+            payload_batch,
+        )
+        if text_batch:
+            # FTS5 has no INSERT OR REPLACE, so delete first.
+            ids = [row[0] for row in text_batch]
+            placeholders = ",".join("?" for _ in ids)
+            self.conn.execute(f"DELETE FROM documents_fts WHERE id IN ({placeholders})", ids)
+            self.conn.executemany("INSERT INTO documents_fts (id, text) VALUES (?, ?)", text_batch)
         return self._rowids_for_ids(table, [row[0] for row in payload_batch])
 
     def _flush_vec_embeddings(
@@ -1293,24 +1284,23 @@ class Index:
         Existing rows for the same rowid are cleared first (``vec0`` has
         no ``INSERT OR REPLACE``), mirroring :meth:`_flush_payloads`'s FTS5
         handling."""
-        if not emb_batch:
-            return
-        dim = len(emb_batch[0][1])
-        for precision in precisions:
+        rows = []
+        for item_id, vector in emb_batch:
+            if vector.ndim != 1:
+                raise ValueError(f"Expected a one-dimensional embedding for {item_id!r}")
+            rows.append((id_rowids[item_id], vector.tobytes()))
+        rowids = list(id_rowids.values())
+        placeholders = ",".join("?" for _ in rowids)
+        for precision in _PRECISIONS:
             vec_table = f"vec_{table}_{precision}"
-            self._ensure_vec_table(vec_table, precision, dim)
-            rows = [
-                (id_rowids[item_id], sqlite3.Binary(vec.astype(np.float32).tobytes()))
-                for item_id, vec in emb_batch
-                if item_id in id_rowids
-            ]
-            if not rows:
+            insert_rows = bool(rows) and precision in precisions
+            if insert_rows:
+                self._ensure_vec_table(vec_table, precision, len(emb_batch[0][1]))
+            elif not self._table_exists(vec_table):
                 continue
-            rowids = [row[0] for row in rows]
-            placeholders = ",".join("?" for _ in rowids)
-            expr = _QUANTIZE_EXPR[precision]
-            with self.conn:
-                self.conn.execute(f"DELETE FROM {vec_table} WHERE rowid IN ({placeholders})", rowids)
+            self.conn.execute(f"DELETE FROM {vec_table} WHERE rowid IN ({placeholders})", rowids)
+            if insert_rows:
+                expr = _QUANTIZE_EXPR[precision]
                 self.conn.executemany(f"INSERT INTO {vec_table} (rowid, embedding) VALUES (?, {expr})", rows)
 
     def close(self) -> None:
