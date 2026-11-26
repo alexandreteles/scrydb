@@ -418,7 +418,7 @@ def _rows_from(source: "str | Path | Iterable[dict]") -> Iterator[dict]:
     *source* may be a path to a UTF-8 JSONL file, or any iterable of
     dict-like rows — a list of dicts, a generator, a HuggingFace
     ``Dataset``/streaming dataset (both iterate as dict rows already), a
-    pandas ``DataFrame.to_dict("records")``, and so on. The format is
+    pandas DataFrame (its columns supply the field names), and so on. The format is
     inferred from the object itself rather than from which method was
     called.
     """
@@ -429,6 +429,13 @@ def _rows_from(source: "str | Path | Iterable[dict]") -> Iterator[dict]:
                 line = line.strip()
                 if line:
                     yield json.loads(line)
+        return
+    if hasattr(source, "columns") and callable(getattr(source, "itertuples", None)):
+        columns = list(source.columns)
+        if len(set(columns)) != len(columns):
+            raise ValueError("DataFrame input must have unique column names")
+        for values in source.itertuples(index=False, name=None):
+            yield dict(zip(columns, values))
         return
     if isinstance(source, Iterable):
         yield from source
