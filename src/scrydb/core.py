@@ -293,7 +293,22 @@ class SentenceEmbedding:
         model_name: str = "mixedbread-ai/mxbai-embed-large-v1",
         truncate_dim: "int | None" = 512,
         query_prompt: str = "Represent this query for searching relevant documents: {query}",
+        *,
+        device: "str | None" = None,
+        backend: "str | None" = None,
+        revision: "str | None" = None,
+        model_kwargs: "dict | None" = None,
+        batch_size: "int | None" = None,
+        max_seq_length: "int | None" = None,
     ):
+        if batch_size is not None and batch_size < 1:
+            raise ValueError("Encoder batch_size must be positive")
+        if max_seq_length is not None and max_seq_length < 1:
+            raise ValueError("max_seq_length must be positive")
+        options = dict(device=device, backend=backend, revision=revision, model_kwargs=model_kwargs)
+        self._load_options = {k: v for k, v in options.items() if v is not None}
+        self._encode_options = {} if batch_size is None else {"batch_size": batch_size}
+        self._max_seq_length = max_seq_length
         self._model_name = model_name
         self._truncate_dim = truncate_dim
         self._query_prompt = query_prompt
@@ -304,15 +319,18 @@ class SentenceEmbedding:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self._model_name, truncate_dim=self._truncate_dim)
+            model = SentenceTransformer(self._model_name, truncate_dim=self._truncate_dim, **self._load_options)
+            if self._max_seq_length is not None:
+                model.max_seq_length = self._max_seq_length
+            self._model = model
         return self._model
 
     def encode_documents(self, texts: list[str]) -> np.ndarray:
-        return np.asarray(self.model.encode(list(texts)), dtype=np.float32)
+        return np.asarray(self.model.encode(list(texts), **self._encode_options), dtype=np.float32)
 
     def encode_queries(self, texts: list[str]) -> np.ndarray:
         prompted = [self._query_prompt.format(query=t) for t in texts]
-        return np.asarray(self.model.encode(prompted), dtype=np.float32)
+        return np.asarray(self.model.encode(prompted, **self._encode_options), dtype=np.float32)
 
 
 # ===========================================================================

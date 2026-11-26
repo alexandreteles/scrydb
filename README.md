@@ -220,6 +220,19 @@ uv run pytest
 step — any command after it (`uv run pytest`, `uv run python -m scrydb.cli --help`,
 `uv run python your_script.py`) runs inside the project's venv.
 
+## Configuring local embedding inference
+
+`SentenceEmbedding` accepts keyword-only `device`, `backend`, `revision` and
+`model_kwargs` for the installed Sentence Transformers runtime. Its
+`batch_size` controls how many texts the encoder processes together,
+independently of the SQLite write batch. `max_seq_length` limits input
+tokens. `truncate_dim` controls the size of the output vector.
+
+For example, `SentenceEmbedding(device="cuda", batch_size=32)` reuses one
+lazily loaded model for both documents and queries. Reduced precision and
+alternate backends require support from the chosen model and runtime.
+Changing input length or model numerics can change retrieval results.
+
 ## Optional extras
 
 - `pip install "scrydb[dense]"` / `uv pip install "scrydb[dense]"` — dense/hybrid search via `sentence-transformers`
