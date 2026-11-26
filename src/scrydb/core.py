@@ -663,7 +663,9 @@ class Index:
         pbar = tqdm(desc=desc, unit="rows", unit_scale=True, total=limit)
 
         def flush():
-            id_rowids = self._flush_payloads(table, payload_batch, None if is_query else text_batch)
+            id_rowids = self._flush_payloads(
+                table, payload_batch, None if is_query else text_batch, query_text_field=text_field
+            )
             self._flush_vec_embeddings(table, id_rowids, emb_batch, precisions)
             payload_batch.clear()
             text_batch.clear()
@@ -833,13 +835,13 @@ class Index:
         ids = self._resolve_query_ids(queries)
         run = Run()
         desc = f"batch_search(mode={mode!r}, rerank={rerank_with!r})"
+        has_field_column = self._has_query_text_field()
         for query_id in tqdm(ids, desc=desc, unit="queries"):
-            query_payload = self.queries.get(query_id) or {}
-            query_text = query_payload.get("text")
+            query_text = self._stored_query_text(query_id, has_field_column)
 
             if mode == "lexical":
                 if query_text is None:
-                    raise ValueError(f"Query {query_id!r} has no stored 'text'; required for mode='lexical'.")
+                    raise ValueError(f"Query {query_id!r} has no stored query text for mode='lexical'.")
                 base_limit = rerank_depth if rerank_with else top_k
                 ranked = self._lexical_rank(query_text, limit=base_limit, b=bm25_b, k1=bm25_k1, raw=raw)
                 if rerank_with:
@@ -858,7 +860,7 @@ class Index:
             elif mode == "hybrid":
                 if query_text is None:
                     raise ValueError(
-                        f"Query {query_id!r} has no stored 'text'; required for mode='hybrid' (lexical stage)."
+                        f"Query {query_id!r} has no stored query text for mode='hybrid' (lexical stage)."
                     )
                 lexical = self._lexical_rank(query_text, limit=candidate_limit, b=bm25_b, k1=bm25_k1)
                 semantic = self._semantic_rank(
@@ -875,6 +877,16 @@ class Index:
 
             run[query_id] = self._materialize(ranked, top_k)
         return run
+
+    def _has_query_text_field(self) -> bool:
+        return any(row[1] == "text_field" for row in self.conn.execute("PRAGMA table_info(queries)"))
+
+    def _stored_query_text(self, query_id: str, has_field_column: bool):
+        # Old database files have only id and payload. Reading them never needs
+        # a schema write. Custom field names can differ between query rows.
+        column = "text_field" if has_field_column else "'text'"
+        row = self.conn.execute(f"SELECT payload, {column} FROM queries WHERE id=?", (query_id,)).fetchone()
+        return json.loads(row[0]).get(row[1]) if row else None
 
     def _resolve_query_ids(self, queries: "str | list[str] | None") -> list[str]:
         if queries is None:
@@ -1260,7 +1272,9 @@ class Index:
         finally:
             self.conn.enable_load_extension(False)
 
-    def _flush_payloads(self, table: str, payload_batch: list, text_batch: "list | None") -> "dict[str, int]":
+    def _flush_payloads(
+        self, table: str, payload_batch: list, text_batch: "list | None", query_text_field: str = "text"
+    ) -> "dict[str, int]":
         """Upsert *payload_batch* (``(id, payload_json)`` pairs) into
         *table* — an ``id`` that already exists keeps its ``rowid``
         (SQLite UPDATE-in-place semantics), which is what lets a
@@ -1277,6 +1291,16 @@ class Index:
                 "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
                 payload_batch,
             )
+            if table == "queries":
+                has_field_column = self._has_query_text_field()
+                if not has_field_column and query_text_field != "text":
+                    self.conn.execute("ALTER TABLE queries ADD COLUMN text_field TEXT NOT NULL DEFAULT 'text'")
+                    has_field_column = True
+                if has_field_column:
+                    self.conn.executemany(
+                        "UPDATE queries SET text_field=? WHERE id=?",
+                        ((query_text_field, item_id) for item_id, _ in payload_batch),
+                    )
             if text_batch:
                 # FTS5 has no INSERT OR REPLACE, so delete first.
                 ids = [row[0] for row in text_batch]
