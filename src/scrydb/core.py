@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import warnings
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Iterator
@@ -726,8 +727,10 @@ class Index:
         candidate_limit: int = 50,
         rrf_k: int = 60,
         raw: bool = False,
-        bm25_b: float = 0.6,
-        bm25_k1: float = 0.9,
+        bm25_b: "float | None" = None,
+        bm25_k1: "float | None" = None,
+        *,
+        bm25_text_weight: "float | None" = None,
     ) -> list[SearchResult]:
         """Run one query, return a ranked list of :class:`SearchResult`.
 
@@ -762,14 +765,16 @@ class Index:
             themselves). If ``False`` (default), it is sanitized and its
             terms OR-joined, which is safe for arbitrary natural-language
             input (e.g. a trailing "?" no longer raises a syntax error).
-        bm25_b, bm25_k1:
-            BM25 parameters passed through to FTS5's ``bm25()``, used
-            whenever ``mode`` is ``"lexical"`` or ``"hybrid"``.
+        bm25_text_weight:
+            FTS5 weight for the indexed text column (default 0.9). FTS5 fixes its
+            BM25 constants at k1=1.2 and b=0.75. The old bm25_b and bm25_k1
+            arguments are deprecated. Only bm25_k1 ever weighted indexed text.
         """
+        text_weight = self._bm25_text_weight(bm25_text_weight, bm25_b, bm25_k1)
         rerank_with = self._normalize_rerank(rerank)
         if mode == "lexical":
             base_limit = rerank_depth if rerank_with else top_k
-            ranked = self._lexical_rank(query, limit=base_limit, b=bm25_b, k1=bm25_k1, raw=raw)
+            ranked = self._lexical_rank(query, limit=base_limit, text_weight=text_weight, raw=raw)
             if rerank_with:
                 ranked = self._rerank_vec(ranked, rerank_with, limit=top_k, query_text=query)
         elif mode == "semantic":
@@ -781,7 +786,7 @@ class Index:
                 rerank_depth=rerank_depth,
             )
         elif mode == "hybrid":
-            lexical = self._lexical_rank(query, limit=candidate_limit, b=bm25_b, k1=bm25_k1)
+            lexical = self._lexical_rank(query, limit=candidate_limit, text_weight=text_weight)
             semantic = self._semantic_rank(
                 query_text=query,
                 limit=candidate_limit,
@@ -807,12 +812,14 @@ class Index:
         candidate_limit: int = 50,
         rrf_k: int = 60,
         raw: bool = False,
-        bm25_b: float = 0.6,
-        bm25_k1: float = 0.9,
+        bm25_b: "float | None" = None,
+        bm25_k1: "float | None" = None,
+        *,
+        bm25_text_weight: "float | None" = None,
     ) -> Run:
         """Run many stored queries, return a :class:`Run`.
 
-        Same ``mode``/``precision``/``rerank``/``raw``/``bm25_b``/``bm25_k1``
+        Same ``mode``/``precision``/``rerank``/``raw``/``bm25_text_weight``
         vocabulary as :meth:`search`, but driven by stored query ids
         instead of a literal query string.
 
@@ -828,6 +835,7 @@ class Index:
         text with the attached model, guaranteeing the same vector used
         when the run was originally built.
         """
+        text_weight = self._bm25_text_weight(bm25_text_weight, bm25_b, bm25_k1)
         rerank_with = self._normalize_rerank(rerank)
         precision_n = _normalize_precision(precision)
         ids = self._resolve_query_ids(queries)
@@ -841,7 +849,7 @@ class Index:
                 if query_text is None:
                     raise ValueError(f"Query {query_id!r} has no stored 'text'; required for mode='lexical'.")
                 base_limit = rerank_depth if rerank_with else top_k
-                ranked = self._lexical_rank(query_text, limit=base_limit, b=bm25_b, k1=bm25_k1, raw=raw)
+                ranked = self._lexical_rank(query_text, limit=base_limit, text_weight=text_weight, raw=raw)
                 if rerank_with:
                     ranked = self._rerank_vec(
                         ranked, rerank_with, limit=top_k, query_text=query_text, query_id=query_id
@@ -860,7 +868,7 @@ class Index:
                     raise ValueError(
                         f"Query {query_id!r} has no stored 'text'; required for mode='hybrid' (lexical stage)."
                     )
-                lexical = self._lexical_rank(query_text, limit=candidate_limit, b=bm25_b, k1=bm25_k1)
+                lexical = self._lexical_rank(query_text, limit=candidate_limit, text_weight=text_weight)
                 semantic = self._semantic_rank(
                     query_text=query_text,
                     query_id=query_id,
@@ -947,17 +955,31 @@ class Index:
     # is what lets `search`, `batch_search`, and the hybrid fusion stage all
     # share the same building blocks instead of three near-duplicate methods.
 
-    def _lexical_rank(self, query: str, limit: int, b: float = 0.6, k1: float = 0.9, raw: bool = False):
+    @staticmethod
+    def _bm25_text_weight(weight, legacy_b, legacy_k1) -> float:
+        if legacy_b is not None or legacy_k1 is not None:
+            warnings.warn(
+                "bm25_b and bm25_k1 are deprecated. FTS5 fixes b and k1. Use "
+                "bm25_text_weight for the indexed text column.",
+                DeprecationWarning, stacklevel=3,
+            )
+        if legacy_k1 is not None:
+            if weight is not None:
+                raise ValueError("Specify only one of bm25_text_weight and bm25_k1")
+            weight = legacy_k1
+        return 0.9 if weight is None else float(weight)
+
+    def _lexical_rank(self, query: str, limit: int, text_weight: float = 0.9, raw: bool = False):
         q = query if raw else _as_or_query(query)
         if not q:
             return []
         cur = self.conn.execute(
             """
-            SELECT id, bm25(documents_fts, ?, ?) AS score
+            SELECT id, bm25(documents_fts, 0.0, ?) AS score
             FROM documents_fts WHERE documents_fts MATCH ?
             ORDER BY score LIMIT ?
             """,
-            (float(b), float(k1), q, limit),
+            (text_weight, q, limit),
         )
         # FTS5's bm25() is lower-is-better; negate so "higher is better"
         # holds for every ranker's score, matching cosine/rrf.

@@ -56,6 +56,10 @@ idx.batch_search(mode="semantic", precision="binary", rerank="float").write_trec
 idx.batch_search(mode="hybrid").write_trec("./path/to/hybrid/run")
 ```
 
+For lexical and hybrid search, `bm25_text_weight` sets the FTS5 weight of the
+indexed text column (default 0.9). FTS5 fixes its BM25 constants at
+`k1=1.2` and `b=0.75`.
+
 ### Search modes, precision, and rerank
 
 `search()`/`batch_search()` take three orthogonal knobs:
