@@ -50,6 +50,7 @@ precomputed embeddings are indexed/searched).
 
 from __future__ import annotations
 
+import heapq
 import json
 import re
 import sqlite3
@@ -1153,25 +1154,12 @@ class Index:
             return []
 
         value, expr = self._query_expr(precision, stored, float_vector)
-        where = [f"embedding MATCH {expr}"]
-        params: list = [value]
-
         if candidate_ids is not None:
-            if not candidate_ids:
-                return []
-            rowid_map = self._rowids_for_ids(collection, candidate_ids)
-            rowids = list(rowid_map.values())
-            if not rowids:
-                return []
-            placeholders = ",".join("?" for _ in rowids)
-            where.append(f"rowid IN ({placeholders})")
-            params.extend(rowids)
-
-        where.append("k = ?")
-        params.append(limit)
+            return self._score_candidates(collection, table, precision, expr, value, candidate_ids, limit)
 
         cur = self.conn.execute(
-            f"SELECT rowid, distance FROM {table} WHERE {' AND '.join(where)} ORDER BY distance", params
+            f"SELECT rowid, distance FROM {table} "
+            f"WHERE embedding MATCH {expr} AND k = ? ORDER BY distance", (value, limit)
         )
         rows = cur.fetchall()
         if not rows:
@@ -1183,6 +1171,29 @@ class Index:
             for rowid, dist in rows
             if rowid in rowid_to_id
         ]
+
+    def _score_candidates(self, collection, table, precision, expr, value, candidate_ids, limit):
+        """Point-read shortlisted embeddings. Filtered vec0 KNN reads the full vector chunks."""
+        if limit <= 0 or not candidate_ids:
+            return []
+        distance_fn = "vec_distance_hamming" if precision == "binary" else "vec_distance_cosine"
+        ids = list(dict.fromkeys(candidate_ids))
+        distances = []
+        # Leave room for the query vector on SQLite builds with a 999-variable limit.
+        for offset in range(0, len(ids), 900):
+            batch = ids[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            # CROSS JOIN keeps the shortlisted document IDs on the outside of the
+            # loop, giving vec0 a single rowid equality for each candidate.
+            distances.extend(self.conn.execute(
+                f"SELECT d.id, {distance_fn}(v.embedding, {expr}) "
+                f"FROM {collection} AS d CROSS JOIN {table} AS v "
+                f"WHERE d.id IN ({placeholders}) AND v.rowid = d.rowid",
+                [value, *batch],
+            ))
+        closest = heapq.nsmallest(limit, distances, key=lambda hit: (hit[1], hit[0]))
+        field = _SCORE_FIELD[precision]
+        return [(doc_id, {field: _score_from_distance(precision, distance)}) for doc_id, distance in closest]
 
     def _rowids_for_ids(self, collection: str, ids: "list[str]") -> "dict[str, int]":
         ids = [str(i) for i in ids]
