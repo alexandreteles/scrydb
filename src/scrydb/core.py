@@ -1150,7 +1150,12 @@ class Index:
         """
         table = f"vec_{collection}_{precision}"
         if not self._table_exists(table):
-            return []
+            if self.conn.execute(f"SELECT 1 FROM {collection} LIMIT 1").fetchone() is None:
+                return []
+            raise RuntimeError(
+                f"The {collection} collection has no {precision} vector index. "
+                "Index embeddings at the requested precision or choose an available precision."
+            )
 
         value, expr = self._query_expr(precision, stored, float_vector)
         where = [f"embedding MATCH {expr}"]
