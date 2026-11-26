@@ -917,13 +917,13 @@ class Index:
     def highlight(
         self,
         query: str,
-        column: int = 0,
+        column: int = 1,
         pre: str = "<b>",
         post: str = "</b>",
         limit: int = 20,
     ) -> list[SearchResult]:
-        """Full column text of matching documents with match markup, via
-        SQLite's ``highlight()``."""
+        """Full text with match markup. FTS column 1 contains the document
+        text; column 0 contains its unindexed ID."""
         q = _as_or_query(query)
         if not q:
             return []
