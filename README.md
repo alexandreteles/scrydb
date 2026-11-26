@@ -9,7 +9,10 @@
 - Semantic search over the entire index is made possible by [`sqlite-vec`](https://github.com/asg017/sqlite-vec), a small, dependency-free vector search extension for SQLite. Every embedding can be searched at three precisions: **binary** (1 bit/dim, Hamming distance), **int8** (1 byte/dim, cosine), and **float** (full precision, cosine) — trading index size and speed against ranking quality, and combinable as a two-stage rerank (e.g. binary-first >> float-precision rerank).
 - Hybrid search relies on [Reciprocal Rank Fusion](https://dl.acm.org/doi/10.1145/1571941.1572114) to fuse lexical and semantic search results.
 
-The library is compatible with [Sentence Transformers](https://www.sbert.net/index.html). However, it is also possible to store precomputed embeddings for both queries and documents.
+The library works with [Sentence Transformers](https://www.sbert.net/index.html)
+or precomputed embeddings. The model name alone does not determine the vector
+space. See [matching an index to its encoder](docs/embedding-settings.md)
+when using the Qwen example from the paper or sharing an index.
 
 > [!NOTE]  
 > The evaluation protocol, benchmark results, and examples are available at [`scrydb-eval`](https://github.com/breuert/scrydb-eval/), the corresponding resources are shared on [Hugging Face](https://huggingface.co/datasets/breuert/scrydb-eval). A preprint paper with more details is available at <https://arxiv.org/abs/2608.24060>. 
