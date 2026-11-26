@@ -97,10 +97,17 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _search_options(args: argparse.Namespace) -> dict:
+    return dict(
+        mode=args.mode, top_k=args.top_k, rerank=args.rerank, precision=args.precision,
+        rerank_depth=args.rerank_depth, candidate_limit=args.candidate_limit, rrf_k=args.rrf_k,
+    )
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     with _open_index(args.db, args.model) as index:
         results = index.search(
-            args.query, mode=args.mode, top_k=args.top_k, rerank=args.rerank, precision=args.precision
+            args.query, **_search_options(args)
         )
         _print_results(results)
     return 0
@@ -121,9 +128,7 @@ def _run_batch_search(index: Index, args: argparse.Namespace):
         f"(mode={args.mode!r}, precision={args.precision!r}, rerank={args.rerank!r})",
         file=sys.stderr,
     )
-    run = index.batch_search(
-        mode=args.mode, top_k=args.top_k, rerank=args.rerank, precision=args.precision
-    )
+    run = index.batch_search(**_search_options(args))
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     run.write_trec(out, tag=args.tag)
@@ -163,7 +168,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
         if args.query:
             results = index.search(
-                args.query, mode=args.mode, top_k=args.top_k, rerank=args.rerank, precision=args.precision
+                args.query, **_search_options(args)
             )
             _print_results(results)
             return 0
@@ -228,6 +233,12 @@ def _add_field_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_search_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--rerank-depth", type=int, default=int(_env("SCRYDB_RERANK_DEPTH", "200")),
+                        help="First-stage candidates available for reranking")
+    parser.add_argument("--candidate-limit", type=int, default=int(_env("SCRYDB_CANDIDATE_LIMIT", "50")),
+                        help="Results per branch for hybrid fusion")
+    parser.add_argument("--rrf-k", type=int, default=int(_env("SCRYDB_RRF_K", "60")),
+                        help="Reciprocal-rank fusion smoothing constant")
     parser.add_argument(
         "--mode", choices=["lexical", "semantic", "hybrid"], default=_env("SCRYDB_MODE", "lexical"),
         help="env: SCRYDB_MODE (default: %(default)s)",
